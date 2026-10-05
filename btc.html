@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xvenue-arb: Bitcoin</title>
+<meta name="description" content="Fair value, edge after fees and hedge size for Polymarket's Bitcoin markets, with a backtest of the 5-minute Up or Down markets.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+<style>
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px 28px}
+  @media (max-width:700px){.grid2{grid-template-columns:1fr}}
+  .big{font-size:22px;font-weight:600}
+  svg text{font:11px -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;fill:#666}
+  td.hi{background:#eef7ee}
+</style>
+</head>
+<body>
+<h1>xvenue-arb</h1>
+<p class="controls"><a href="/">Tennis and golf</a> <span class="muted">|</span> <b>Bitcoin</b></p>
+<p class="desc">Polymarket lists a Bitcoin "Up or Down" market every 5 minutes, and daily markets on whether Bitcoin will be above a set of prices at noon New York time. This page prices both from Bitcoin's volatility, shows the edge after Polymarket's taker fee, and shows how much BTC it would take to hedge. The backtest below checks whether any of it would have made money.</p>
+
+<h2>Live: 5-minute Up or Down</h2>
+<div class="box">
+  <p id="win" class="muted">Loading…</p>
+  <div class="grid2">
+    <dl class="kv" id="state"></dl>
+    <dl class="kv" id="trade"></dl>
+  </div>
+  <div id="spark"></div>
+  <p class="small muted" id="feeds"></p>
+</div>
+
+<h3>How the fair price is calculated</h3>
+<ul class="small">
+  <li>The market resolves Up if Chainlink's BTC/USD 60-second TWAP at the end of the window is at or above the value at the start. The start value (the strike) is known when the window opens.</li>
+  <li>Over a few minutes the price is treated as a random walk with volatility σ, measured from the last 30 minutes of one-second Binance prices.</li>
+  <li>Before the last minute, the final average A is the current price plus noise with variance σ²S²(t − 60 + 60/3): the average of a random walk over 60 seconds varies only a third as much as the price at a single moment.</li>
+  <li>Inside the last minute, part of the average is already fixed. If a share w of the 60 seconds has passed, A = w × (average so far) + (1 − w) × (rest), and the uncertain part has standard deviation (1 − w)σS√(t/3). So the price stops moving well before the window closes.</li>
+  <li>P(Up) = N((E[A] − strike) / sd(A)). Edge = P − ask − 0.07 × ask × (1 − ask). The fee is 1.75 cents per share at 50 cents, so the model has to beat the ask by more than that.</li>
+  <li>Hedge: an Up share gains about Δ = φ(z) / sd(A) dollars per $1 rise in BTC, so 100 shares are hedged by shorting 100Δ BTC on the perpetual. Near 50/50 that is hundreds of times the premium in BTC, so perpetual fees usually cost more than the edge.</li>
+  <li>The backtest below found this model is less accurate than the market's own prices. Treat the EV above as the model's opinion, not a signal.</li>
+</ul>
+
+<h2>Backtest: 5-minute markets</h2>
+<div id="research"><p class="muted">Loading…</p></div>
+
+<h2>Daily strikes vs Deribit options</h2>
+<p class="desc">Each "Bitcoin above K" market pays $1 if the Binance BTC/USDT one-minute close at noon New York time is above K. That is a digital option. Deribit lists BTC options that expire at 08:00 UTC, so the fair price here interpolates Deribit's implied variance between the expiries either side of noon. It also includes the volatility smile, by pricing a tight call spread around K with each strike at its own implied vol.</p>
+<div id="daily"><p class="muted">Loading…</p></div>
+<ul class="small">
+  <li><b>Flat vol</b> is N(d₂) at the strike's own implied vol. <b>Smile</b> is (C(K − h) − C(K + h)) / 2h with each call at its own vol, which equals N(d₂) − vega × dσ/dK. Where implied vol falls as the strike rises (the put side of BTC's smile), "above K" is worth more than the flat-vol price. Where it rises (the call wing), it is worth less. The difference is often several cents.</li>
+  <li>EV is the expected profit per $1 contract after Polymarket's taker fee, if Deribit's prices are right. Positive values are highlighted.</li>
+  <li>Δ is the BTC to short (buying Yes) or buy (buying No) per contract to stay flat against small moves. The position still loses on large moves (gamma) and needs rehedging. Deribit settles 8 hours away from Polymarket, so the two cannot be matched exactly.</li>
+</ul>
+<p class="small muted">Data: Polymarket Gamma, CLOB and live-data feeds, Chainlink BTC/USD through Polymarket, Binance spot and perpetual, Deribit public API. Not trading advice. Source: <a href="https://github.com/hpark236/xvenue-arb">github.com/hpark236/xvenue-arb</a></p>
+
+<script type="module">
+import { upProbability, realisedSigma, edge, takerCost } from './lib/btc.js';
+const $ = s => document.querySelector(s);
+const pct = (x, d = 1) => x == null || !isFinite(x) ? '-' : (x * 100).toFixed(d) + '%';
+const c3 = x => x == null || !isFinite(x) ? '-' : x.toFixed(3);
+const usd = (x, d = 0) => x == null || !isFinite(x) ? '-' : '$' + x.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+const sgn = (x, f = c3) => x == null ? '-' : `<span class="${x > 0 ? 'pos' : 'neg'}">${x > 0 ? '+' : ''}${f(x)}</span>`;
+const PERP_TAKER = 0.0005; // Binance USD-M taker fee per side
+
+// ---------- live 5-minute market ----------
+let mkt = null, sigma = null, book = { up: null, down: null }, trace = [];
+const cl = new Map(); // second -> Chainlink BTC/USD
+const bn = new Map(); // second -> Binance BTCUSDT close
+const avgOf = (m, a, b) => { let s = 0, n = 0; for (let t = a; t < b; t++) { const v = m.get(t); if (v) { s += v; n++; } } return n ? s / n : null; };
+const latest = m => { let k = -1, v = null; for (const [t, x] of m) if (t > k) { k = t; v = x; } return v; };
+
+async function binanceSeconds(fromSec, n = 1000) {
+  const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=${n}&startTime=${fromSec * 1000}`);
+  if (!r.ok) throw new Error('binance');
+  for (const k of await r.json()) bn.set(k[0] / 1000, +k[4]);
+}
+async function refreshSigma() {
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    await binanceSeconds(now - 1800); await binanceSeconds(now - 800, 800);
+    const xs = []; for (let t = now - 1800; t < now; t++) if (bn.has(t)) xs.push(bn.get(t));
+    sigma = realisedSigma(xs);
+  } catch {
+    // Binance blocks some regions: fall back to Coinbase one-minute candles, scaled to seconds
+    const r = await fetch('https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60').then(r => r.json());
+    const xs = r.slice(0, 30).reverse().map(k => k[4]);
+    const s1m = realisedSigma(xs);
+    sigma = s1m ? s1m / Math.sqrt(60) : null;
+  }
+}
+
+function chainlinkFeed() {
+  const ws = new WebSocket('wss://ws-live-data.polymarket.com');
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ action: 'subscribe', subscriptions: [{ topic: 'crypto_prices_chainlink', type: '*', filters: '{"symbol":"btc/usd"}' }] }));
+    ws._ping = setInterval(() => ws.readyState === 1 && ws.send('PING'), 10000);
+  };
+  ws.onmessage = e => {
+    let j; try { j = JSON.parse(e.data); } catch { return; }
+    const rows = j.payload?.data || (j.payload?.value ? [j.payload] : []);
+    for (const r of rows) cl.set(Math.floor(r.timestamp / 1000), r.value);
+  };
+  ws.onclose = () => { clearInterval(ws._ping); setTimeout(chainlinkFeed, 2000); };
+}
+
+async function loadBook() {
+  if (!mkt) return;
+  const one = async id => {
+    const b = await fetch(`https://clob.polymarket.com/book?token_id=${id}`).then(r => r.json());
+    const bids = (b.bids || []).map(x => +x.price).sort((a, b) => b - a), asks = (b.asks || []).map(x => +x.price).sort((a, b) => a - b);
+    return { bid: bids[0] ?? null, ask: asks[0] ?? null };
+  };
+  try { [book.up, book.down] = await Promise.all([one(mkt.upToken), one(mkt.downToken)]); } catch {}
+}
+
+async function loadApi() {
+  const j = await fetch('/api/btc').then(r => r.json());
+  if (j.now && (!mkt || j.now.slug !== mkt.slug)) { mkt = j.now; trace = []; book = { up: null, down: null }; }
+  renderDaily(j);
+  return j;
+}
+let perp = null;
+
+function tick() {
+  if (!mkt) return;
+  const now = Date.now() / 1000, start = mkt.start / 1000, end = mkt.end / 1000, L = mkt.twapSeconds || 60;
+  if (now >= end + 2) { loadApi().then(j => { perp = j.perp; }); return; }
+  const S = latest(cl) ?? latest(bn);
+  // Strike = Chainlink average over the minute before the window. If the page opened too late to
+  // have it, use Binance for that minute plus the current Chainlink-Binance gap.
+  let K = avgOf(cl, start - L, start), kSrc = 'Chainlink';
+  if (!K || [...cl.keys()].filter(t => t >= start - L && t < start).length < L * 0.8) {
+    const b = avgOf(bn, start - L, start), basis = latest(cl) && latest(bn) ? latest(cl) - latest(bn) : 0;
+    if (b) { K = b + basis; kSrc = 'estimated from Binance'; }
+  }
+  const tRem = Math.max(0, end - now);
+  const lines = [['Window', `${new Date(mkt.start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} to ${new Date(mkt.end).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}, ${Math.ceil(tRem)}s left`]];
+  $('#win').innerHTML = `<a href="${mkt.url}" target="_blank" rel="noopener">${mkt.question}</a>`;
+  if (!S || !K || !sigma) { $('#state').innerHTML = '<dt>Status</dt><dd>Waiting for price feeds…</dd>'; return; }
+  const inAvg = tRem < L;
+  const m = upProbability({ S, K, sigma, tRem, L, avgSoFar: inAvg ? avgOf(cl.size ? cl : bn, end - L, Math.floor(now) + 1) : null });
+  const upAsk = book.up?.ask, dnAsk = book.down?.ask ?? (book.up?.bid != null ? 1 - book.up.bid : null);
+  const mid = book.up?.bid != null && book.up?.ask != null ? (book.up.bid + book.up.ask) / 2 : null;
+  trace.push({ t: now, fair: m.p, mid });
+  const eu = upAsk ? edge(m.p, upAsk, mkt.feeRate) : null, ed = dnAsk ? edge(1 - m.p, dnAsk, mkt.feeRate) : null;
+  const best = [eu && { side: 'Up', ...eu, ask: upAsk }, ed && { side: 'Down', ...ed, ask: dnAsk }].filter(Boolean).sort((a, b) => b.ev - a.ev)[0];
+  $('#state').innerHTML = [
+    ...lines,
+    ['Strike (start TWAP)', `${usd(K, 2)} <span class="muted small">${kSrc}</span>`],
+    ['BTC now (Chainlink)', `${usd(S, 2)} <span class="${S >= K ? 'pos' : 'neg'}">${S >= K ? '+' : ''}${(S - K).toFixed(2)}</span>`],
+    ['Volatility', `${(sigma * 1e4).toFixed(2)} bp per √s, ${pct(sigma * Math.sqrt(365.25 * 86400), 0)} a year`],
+    ['Final TWAP', `mean ${usd(m.mean, 2)}, sd ${usd(m.sd, 2)}${inAvg ? ', averaging has started' : ''}`],
+    ['Fair P(Up)', `<span class="big">${pct(m.p)}</span>`],
+  ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+  const hedgeBtc = m.delta * 100, hedgeUsd = hedgeBtc * S;
+  $('#trade').innerHTML = [
+    ['Up bid / ask', book.up ? `${c3(book.up.bid)} / ${c3(book.up.ask)}` : '-'],
+    ['Down bid / ask', book.down ? `${c3(book.down.bid)} / ${c3(book.down.ask)}` : '-'],
+    ['Buy Up, EV per share', eu ? `${sgn(eu.ev)} <span class="muted small">cost ${c3(eu.cost)} with fee</span>` : '-'],
+    ['Buy Down, EV per share', ed ? `${sgn(ed.ev)} <span class="muted small">cost ${c3(ed.cost)} with fee</span>` : '-'],
+    ['Kelly stake', best && best.kelly > 0 ? `${pct(best.kelly)} of bankroll on ${best.side}` : 'none, no positive edge'],
+    ['Hedge for 100 Up shares', `short ${hedgeBtc.toFixed(3)} BTC (${usd(hedgeUsd)}), perp fees about ${usd(hedgeUsd * PERP_TAKER * 2, 2)} round trip vs ${usd(100 * (mid ?? m.p), 0)} of contracts`],
+  ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+  $('#feeds').textContent = `Chainlink ticks: ${cl.size}. Binance seconds: ${bn.size}. Perp funding ${perp ? (perp.funding8h * 100).toFixed(4) + '% per 8h' : '-'}.`;
+  spark(start, end);
+}
+
+function spark(start, end) {
+  const W = 640, H = 120, x = t => (t - start) / (end - start) * W, y = p => H - p * H;
+  const path = k => trace.filter(r => r[k] != null).map((r, i) => `${i ? 'L' : 'M'}${x(r.t).toFixed(1)},${y(r[k]).toFixed(1)}`).join('');
+  $('#spark').innerHTML = `<svg viewBox="0 -12 ${W} ${H + 26}" width="100%" style="max-width:${W}px">
+    <line x1="0" x2="${W}" y1="${y(0.5)}" y2="${y(0.5)}" stroke="#ddd"/>
+    <path d="${path('mid')}" fill="none" stroke="#999" stroke-width="1.5"/>
+    <path d="${path('fair')}" fill="none" stroke="#111" stroke-width="1.5"/>
+    <text x="0" y="-2">P(Up): black = model, grey = Polymarket mid</text>
+    <text x="0" y="${H + 12}">window start</text><text x="${W}" y="${H + 12}" text-anchor="end">end</text></svg>`;
+}
+
+// ---------- daily strikes ----------
+function renderDaily(j) {
+  perp = j.perp;
+  if (!j.daily?.length) { $('#daily').innerHTML = `<p>No daily markets available${j.errors?.deribit ? ' (Deribit: ' + j.errors.deribit + ')' : ''}.</p>`; return; }
+  $('#daily').innerHTML = `<p class="small">BTC ${usd(j.spot, 0)} on Binance. Perpetual ${perp ? usd(perp.mark, 0) + ', funding ' + (perp.funding8h * 100).toFixed(4) + '% per 8h' : '-'}.</p>` + j.daily.map(d => `
+    <h3><a href="${d.url}" target="_blank" rel="noopener">${d.title}</a> <span class="muted small">${d.hoursLeft.toFixed(1)} hours left</span></h3>
+    <table><thead><tr><th>Strike</th><th>Yes bid</th><th>Yes ask</th><th>Deribit IV</th><th>Flat vol</th><th>Smile</th><th>Buy Yes EV</th><th>Buy No EV</th><th>Δ per 100</th></tr></thead><tbody>${
+      d.strikes.filter(s => s.fair != null && s.yesBid > 0.005 && s.yesAsk < 0.995).map(s => `<tr>
+        <td>${usd(s.K)}</td><td>${c3(s.yesBid)}</td><td>${c3(s.yesAsk)}</td><td>${pct(s.iv)}</td><td>${c3(s.fairFlat)}</td><td><b>${c3(s.fair)}</b></td>
+        <td class="${s.buyYes.ev > 0.01 ? 'hi' : ''}">${sgn(s.buyYes.ev)}</td><td class="${s.buyNo.ev > 0.01 ? 'hi' : ''}">${sgn(s.buyNo.ev)}</td>
+        <td>${(s.deltaBtc * 100).toFixed(3)} BTC</td></tr>`).join('')}</tbody></table>`).join('') +
+    '<p class="small muted">Strikes priced below 0.5 cents or above 99.5 cents are hidden. Refreshes every 30 seconds.</p>';
+}
+
+// ---------- backtest ----------
+async function research() {
+  let r;
+  try { r = await fetch('/research/btc5m.json').then(x => x.json()); } catch { $('#research').innerHTML = '<p>Backtest results not available.</p>'; return; }
+  if (!r.edgeAll) { $('#research').innerHTML = '<p>Backtest results not available.</p>'; return; }
+  const when = new Date(r.builtAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  const tbl = (head, rows) => `<table><thead><tr>${head.map((h, i) => `<th class="${i ? '' : 'l'}">${h}</th>`).join('')}</tr></thead><tbody>${rows.map(c => `<tr>${c.map((v, i) => `<td class="${i ? '' : 'l'}">${v}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+  const cents = x => x == null ? '-' : sgn(x * 100, v => v.toFixed(1) + 'c');
+  const t = x => x == null ? '-' : x.toFixed(1);
+  const edgeRows = rows => rows.map(e => [e.edge, e.fills.toLocaleString(), e.windows ?? '-', cents(e.modelEdge), cents(e.realised), t(e.tStat)]);
+  const H = ['Model says the price is', 'Fills', 'Windows', 'Model edge (average)', 'Actual profit per share', 't (by window)'];
+  $('#research').innerHTML = `
+    <p>${r.resolved.toLocaleString()} resolved windows over ${r.days} days to ${when}: ${r.fills.toLocaleString()} real taker fills from Polymarket's trade log, matched to Binance one-second prices. For each fill the model only sees BTC up to ${r.seenLagSeconds} seconds before the fill's timestamp.</p>
+    <div id="findings"></div>
+    <h3>1. Which reading of the rules matches the real outcomes</h3>
+    ${tbl(['Rule, computed from Binance', 'Agrees with actual result'], r.ruleMatch.map(x => [x.rule, pct(x.agreement)]))}
+    <p class="small">The remaining gap is the difference between Binance and Chainlink prices in close windows.</p>
+    <h3>2. Do takers make money?</h3>
+    <p>All taker fills together: ${cents(r.allTaker.pnlPerShare)} per share after the fee, of which the fee is ${(r.allTaker.feePerShare * 100).toFixed(2)}c (t = ${t(r.allTaker.tStat)}, ${Math.round(r.allTaker.shares).toLocaleString()} shares).</p>
+    <h3>3. Are traded prices probabilities?</h3>
+    ${tbl(['Price paid', 'Fills', 'Average paid', 'That side won', 'Model said'], r.calibration.filter(b => b.fills >= 30).map(b => [b.bin, b.fills.toLocaleString(), pct(b.avgPaid), pct(b.won), pct(b.modelSaid)]))}
+    <h3>4. When the model called a real fill cheap, was it?</h3>
+    <p class="small">Every taker fill, grouped by the model's edge for the side bought (fair value minus price minus fee). If the model has no information, actual profit is the same in every row. Fills in the same window share one outcome, so the t-statistic treats each window as one observation.</p>
+    ${tbl(H, edgeRows(r.edgeAll))}
+    <p class="small">More than 60 seconds left:</p>${tbl(H, edgeRows(r.edgeEarly))}
+    <p class="small">Last 60 seconds, when the TWAP is being averaged:</p>${tbl(H, edgeRows(r.edgeLate))}
+    <h3>5. A rule you could have followed</h3>
+    <p class="small">In each window, copy the first real fill the model rates more than θ cheap, at the same price plus the fee, and hold to the end. One trade per window, so trades are independent.</p>
+    ${tbl(['θ', 'Time', 'Trades', 'Profit per share', 't'], r.strategies.map(x => [x.theta, x.window, x.trades, cents(x.pnlPerShare), t(x.tStat)]))}
+    <h3>6. The minute-price trap</h3>
+    <p class="small">The same rule run on Polymarket's once-a-minute price series, assuming a 1 cent half spread. These prints are not prices anyone could trade at in fast moments, which is why backtests built on them overstate the edge.</p>
+    ${tbl(['θ', 'Trades', 'Profit per share', 't'], r.printTrap.map(x => [x.theta, x.trades, cents(x.pnlPerShare), t(x.tStat)]))}
+    <h3>7. Accuracy by time left (Brier score of each fill, lower is better)</h3>
+    ${tbl(['Seconds left', 'Fills', 'Price paid', 'Model'], r.brierByTime.map(x => [x.secondsLeft, x.fills.toLocaleString(), x.brierPrice.toFixed(4), x.brierModel.toFixed(4)]))}
+    <h3>8. Do outcomes have memory?</h3>
+    ${tbl(['', 'Value'], [['Windows', r.memory.windows], ['Resolved Up', pct(r.memory.upRate)], ['Up after an Up', `${pct(r.memory.upAfterUp)} of ${r.memory.nAfterUp}`], ['Down after a Down', `${pct(r.memory.downAfterDown)} of ${r.memory.nAfterDown}`]])}
+    <p class="small">With no memory both would be close to 50%. A difference under ${pct(2 * Math.sqrt(0.25 / Math.max(1, r.memory.nAfterUp)))} is within noise for this sample.</p>`;
+  findings(r);
+}
+function findings(r) {
+  const naive = r.ruleMatch.find(x => x.rule.startsWith('Price at end'));
+  const best = r.strategies.filter(x => x.window === '0-300s left').sort((a, b) => b.theta - a.theta)[0];
+  const trap = r.printTrap.find(x => x.theta === best.theta) || r.printTrap.at(-1);
+  const calib = r.calibration.filter(b => b.fills >= 1000);
+  const worst = Math.max(...calib.map(b => Math.abs(b.won - b.avgPaid)));
+  const modelWorse = r.brierByTime.filter(x => x.brierModel > x.brierPrice).length;
+  const tail = r.edgeAll.at(-1);
+  $('#findings').innerHTML = `<div class="box"><b>Findings</b><ul>
+    <li><b>The rules matter.</b> "${r.ruleMatch[0].rule}" reproduces ${pct(r.ruleMatch[0].agreement)} of outcomes. Comparing the end price with the start price gets ${pct(naive.agreement)}, so pricing these as ordinary binary options is wrong about 1 window in ${Math.round(1 / Math.max(0.001, r.ruleMatch[0].agreement - naive.agreement))}.</li>
+    <li><b>The fee is the house edge.</b> Takers lost ${(-r.allTaker.pnlPerShare * 100).toFixed(2)}c per share, and ${(r.allTaker.feePerShare * 100).toFixed(2)}c of that was the fee. Before fees they roughly broke even.</li>
+    <li><b>Prices are probabilities.</b> In every 10-cent band with enough fills, the side won within ${(worst * 100).toFixed(1)} points of the price paid.</li>
+    <li><b>The volatility model knows less than the market.</b> Its Brier score is worse than the traded price in ${modelWorse} of ${r.brierByTime.length} time buckets. Traders see Chainlink, the order book and faster exchanges.</li>
+    <li><b>No edge for a follower.</b> Copying the first fill per window that the model rated more than ${best.theta * 100}c cheap made ${(best.pnlPerShare * 100).toFixed(1)}c per share over ${best.trades} windows (t = ${best.tStat?.toFixed(1)}). Fills it rated more than 10c cheap did make ${(tail.realised * 100).toFixed(1)}c per share as a group (t = ${tail.tStat?.toFixed(1)}). That looks like stale quotes being picked off in fast moves, and that money goes to whoever is first.</li>
+    <li><b>Backtests on the minute price series are wrong.</b> The same rule on minute prints shows ${(trap.pnlPerShare * 100).toFixed(1)}c per share (t = ${trap.tStat?.toFixed(1)}), an edge that disappears against real fills.</li>
+  </ul></div>`;
+}
+
+chainlinkFeed();
+await refreshSigma().catch(() => {});
+await loadApi().catch(() => { $('#win').textContent = 'Could not load market data.'; });
+loadBook(); research();
+setInterval(tick, 1000);
+setInterval(loadBook, 1500);
+setInterval(() => refreshSigma().catch(() => {}), 60000);
+setInterval(() => loadApi().catch(() => {}), 30000);
+setInterval(() => { const now = Math.floor(Date.now() / 1000); binanceSeconds(now - 90, 90).catch(() => {}); }, 15000);
+</script>
+</body>
+</html>
