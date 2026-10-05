@@ -160,7 +160,7 @@ function tick() {
     ['Down bid / ask', book.down ? `${c3(book.down.bid)} / ${c3(book.down.ask)}` : '-'],
     ['Buy Up, EV per share', eu ? `${sgn(eu.ev)} <span class="muted small">cost ${c3(eu.cost)} with fee</span>` : '-'],
     ['Buy Down, EV per share', ed ? `${sgn(ed.ev)} <span class="muted small">cost ${c3(ed.cost)} with fee</span>` : '-'],
-    ['Kelly stake', best && best.kelly > 0 ? `${pct(best.kelly)} of bankroll on ${best.side}` : 'none, no positive edge'],
+    ['Kelly stake if the model were right', best && best.kelly > 0 ? `${pct(best.kelly)} on ${best.side} <span class="muted small">(the backtest says it is not, so this is illustration only)</span>` : 'none, no positive edge'],
     ['Hedge for 100 Up shares', `short ${hedgeBtc.toFixed(3)} BTC (${usd(hedgeUsd)}), perp fees about ${usd(hedgeUsd * PERP_TAKER * 2, 2)} round trip vs ${usd(100 * (mid ?? m.p), 0)} of contracts`],
   ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   $('#feeds').textContent = `Chainlink ticks: ${cl.size}. Binance seconds: ${bn.size}. Perp funding ${perp ? (perp.funding8h * 100).toFixed(4) + '% per 8h' : '-'}.`;
